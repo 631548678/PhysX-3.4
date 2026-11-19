@@ -35,8 +35,8 @@ jobs:
           RAW_NDK_PATH: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
           $ErrorActionPreference = "Stop"
-          $ndkWinPath = $env:RAW_NDK_PATH
-          $ndkPosixPath = ($ndkWinPath -replace '\\', '/').TrimEnd('/')
+          $ndkWinPath = $env:RAW_NDK_PATH.TrimEnd('\', '/')
+          $ndkPosixPath = $ndkWinPath -replace '\\', '/'
 
           $androidDirs = Get-ChildItem -Path "PhysX_3.4" -Recurse -Directory -Filter "android*" |
             Where-Object { $_.FullName -match "compiler" }
@@ -52,18 +52,30 @@ jobs:
           Write-Host "Selected PhysX_3.4 Build Directory: $targetDir"
           "PHYSX_ANDROID_DIR=$targetDir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-          $makedefs = Get-ChildItem -Path $targetDir -Recurse -File -Filter "Makedefs*" | Select-Object -First 1
-          if ($makedefs) {
-            $mkText = Get-Content $makedefs.FullName -Raw
-            if ($mkText -match "Externals/(android-ndk-[a-zA-Z0-9._-]+)") {
-              $expectedNdkFolderName = $Matches[1]
-              $externalsNdkPath = Join-Path (Resolve-Path "Externals") $expectedNdkFolderName
-              Write-Host "Linking NDK to: $externalsNdkPath"
-              if (-not (Test-Path $externalsNdkPath)) {
-                New-Item -ItemType Directory -Path (Split-Path $externalsNdkPath) -Force | Out-Null
-                cmd /c mklink /J "`"$externalsNdkPath`"" "`"$ndkWinPath`""
-              }
+          # 扫描所有 Makefile 中引用的 Externals/android-ndk-* 名称，全部创建目录联接
+          $externalsRoot = (Resolve-Path "Externals").Path
+          $allText = (Get-ChildItem -Path $targetDir -Recurse -File | ForEach-Object { Get-Content $_.FullName -Raw }) -join "`n"
+          $ndkMatches = [regex]::Matches($allText, "Externals/(android-ndk-[a-zA-Z0-9._-]+)") |
+            ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique
+
+          if (-not $ndkMatches) {
+            $ndkMatches = @("android-ndk-r9d", "android-ndk-r13b", "android-ndk-r16b")
+          }
+
+          foreach ($folderName in $ndkMatches) {
+            $linkPath = Join-Path $externalsRoot $folderName
+            Write-Host "Creating Junction: $linkPath -> $ndkWinPath"
+            if (Test-Path $linkPath) {
+              Remove-Item $linkPath -Force -Recurse
             }
+            New-Item -ItemType Junction -Path $linkPath -Target $ndkWinPath | Out-Null
+
+            # 强校验 64 位 g++ 编译器通过联接路径确实可访问
+            $expectedGxx = Join-Path $linkPath "toolchains\aarch64-linux-android-4.9\prebuilt\windows-x86_64\bin\aarch64-linux-android-g++.exe"
+            if (-not (Test-Path $expectedGxx)) {
+              Write-Error "Compiler not found via junction at: $expectedGxx"
+            }
+            Write-Host "Verified compiler exists: $expectedGxx"
           }
 
           $vars = @("ANDROID_NDK_ROOT", "NDK_ROOT", "ANDROID_NDK", "NDKROOT", "NDK_PATH")
@@ -89,7 +101,7 @@ jobs:
             $text = $text -replace "-g0", "-g"
             $text = $text -replace "gnu-libstdc\+\+/4\.8", "gnu-libstdc++/4.9"
 
-            # 2. 无条件将 32 位工具链替换为 64 位 aarch64 工具链
+            # 2. 将 32 位工具链替换为 64 位 aarch64 工具链
             $text = $text -replace "armeabi-v7a", "arm64-v8a"
             $text = $text -replace "arm-linux-androideabi-4\.8", "aarch64-linux-android-4.9"
             $text = $text -replace "arm-linux-androideabi-", "aarch64-linux-android-"
@@ -99,7 +111,7 @@ jobs:
             $text = $text -replace "android-9", "android-21"
 
             # 3. 清理 32 位 ARMv5/ARMv7 专属宏与编译参数
-            $text = $text -replace "-D__ARM_ARCH_5[A-Z]*__", ""
+            $text = $text -replace "-D__ARM_ARCH_5[A-Z0-9_]*", ""
             $text = $text -replace "-march=armv7-a|-mfpu=neon|-mfloat-abi=softfp|-mthumb-interwork|-marm", ""
 
             if ($text -ne $orig) {
