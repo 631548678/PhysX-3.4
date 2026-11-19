@@ -34,8 +34,9 @@ jobs:
 
           # 1. 体检 NDK 工具链与 Unified Headers
           $gxx = "$ndk/toolchains/aarch64-linux-android-4.9/prebuilt/windows-x86_64/bin/aarch64-linux-android-g++.exe"
-          $inc1 = "$ndk/sysroot/usr/include"
-          $inc2 = "$ndk/sysroot/usr/include/aarch64-linux-android"
+          $sysroot = "$ndk/sysroot"
+          $inc1 = "$sysroot/usr/include"
+          $inc2 = "$sysroot/usr/include/aarch64-linux-android"
           if (-not (Test-Path $gxx) -or -not (Test-Path "$inc1/stdint.h")) {
             Write-Error "NDK toolchain or Unified Headers missing!"
           }
@@ -48,8 +49,12 @@ jobs:
           "BUILD_DIR=$buildDir" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
           "NDK_POSIX=$ndk" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
 
+          # 同时收集 PhysX_3.4 和 PxShared 下的所有 android 编译目录
+          $allAndroidDirs = Get-ChildItem -Path "." -Recurse -Directory -Filter "android*" |
+            Where-Object { $_.FullName -match "compiler" }
+
           $extRoot = (Resolve-Path "Externals").Path
-          $allMkText = (Get-ChildItem -Path $buildDir -Recurse -File | ForEach-Object { Get-Content $_.FullName -Raw }) -join "`n"
+          $allMkText = ($allAndroidDirs | ForEach-Object { Get-ChildItem -Path $_.FullName -Recurse -File } | ForEach-Object { Get-Content $_.FullName -Raw }) -join "`n"
           $ndkNames = [regex]::Matches($allMkText, "Externals/(android-ndk-[a-zA-Z0-9._-]+)") |
             ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique
           if (-not $ndkNames) { $ndkNames = @("android-ndk-r9d", "android-ndk-r13b", "android-ndk-r16b") }
@@ -59,22 +64,29 @@ jobs:
             New-Item -ItemType Junction -Path $lnk -Target $ndkWin | Out-Null
           }
 
-          # 3. 修补 Makefile（arm64 工具链 + C++11 + Unified Headers + DWARF 调试符号）
-          $injectFlags = "-fpic -std=c++11 -isystem $inc1 -isystem $inc2 -D__ANDROID_API__=21"
-          foreach ($f in (Get-ChildItem -Path $buildDir -Recurse -File)) {
-            $t = Get-Content $f.FullName -Raw
-            $o = $t
-            $t = $t -replace "-g0", "-g"
-            $t = $t -replace "gnu-libstdc\+\+/4\.8", "gnu-libstdc++/4.9"
-            $t = $t -replace "armeabi-v7a", "arm64-v8a"
-            $t = $t -replace "arm-linux-androideabi-4\.8", "aarch64-linux-android-4.9"
-            $t = $t -replace "arm-linux-androideabi-", "aarch64-linux-android-"
-            $t = $t -replace "prebuilt/windows/", "prebuilt/windows-x86_64/"
-            $t = $t -replace "arch-arm\b", "arch-arm64"
-            $t = $t -replace "android-(9|16)", "android-21"
-            $t = $t -replace "-D__ARM_ARCH_5[A-Z0-9_]*|-march=armv7-a|-mfpu=neon|-mfloat-abi=softfp|-mthumb-interwork|-marm", ""
-            $t = $t -replace "-fpic\b", $injectFlags
-            if ($t -ne $o) { Set-Content -Path $f.FullName -Value $t -NoNewline }
+          # 3. 修补 PhysX_3.4 和 PxShared 下所有的 android Makefile
+          $sysrootFlags = "--sysroot=$sysroot -isystem $inc1 -isystem $inc2 -D__ANDROID_API__=21"
+          $injectFlags = "-fpic -std=c++11 $sysrootFlags"
+          "SYSROOT_FLAGS=$sysrootFlags" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+          foreach ($aDir in $allAndroidDirs) {
+            foreach ($f in (Get-ChildItem -Path $aDir.FullName -Recurse -File)) {
+              $t = Get-Content $f.FullName -Raw
+              $o = $t
+              $t = $t -replace "-g0", "-g"
+              $t = $t -replace "gnu-libstdc\+\+/4\.8", "gnu-libstdc++/4.9"
+              $t = $t -replace "armeabi-v7a", "arm64-v8a"
+              $t = $t -replace "arm-linux-androideabi-4\.8", "aarch64-linux-android-4.9"
+              $t = $t -replace "arm-linux-androideabi-", "aarch64-linux-android-"
+              $t = $t -replace "prebuilt/windows/", "prebuilt/windows-x86_64/"
+              $t = $t -replace "arch-arm\b", "arch-arm64"
+              $t = $t -replace "android-(9|16)", "android-21"
+              # 修复 r16b 移除 platforms/android-21/arch-arm64/usr/include 导致的 sysroot 失效
+              $t = $t -replace "--sysroot=[^\s`"']+", "--sysroot=$sysroot"
+              $t = $t -replace "-D__ARM_ARCH_5[A-Z0-9_]*|-march=armv7-a|-mfpu=neon|-mfloat-abi=softfp|-mthumb-interwork|-marm", ""
+              $t = $t -replace "-fpic\b", $injectFlags
+              if ($t -ne $o) { Set-Content -Path $f.FullName -Value $t -NoNewline }
+            }
           }
 
           # 4. 单文件冒烟编译检查（确保头文件与 STL 100% 畅通后再跑全量编译）
@@ -83,7 +95,7 @@ jobs:
             -IPxShared/include -IPxShared/src/foundation/include `
             -I"$ndk/sources/cxx-stl/gnu-libstdc++/4.9/include" `
             -I"$ndk/sources/cxx-stl/gnu-libstdc++/4.9/libs/arm64-v8a/include" `
-            -isystem $inc1 -isystem $inc2 -D__ANDROID_API__=21 -DANDROID -std=c++11 -g
+            --sysroot=$sysroot -isystem $inc1 -isystem $inc2 -D__ANDROID_API__=21 -DANDROID -std=c++11 -g
           if ($LASTEXITCODE -ne 0) { Write-Error "Smoke test failed! Headers or STL mismatch." }
           Remove-Item $smokeObj -Force -ErrorAction SilentlyContinue
           Write-Host "Audit & Smoke Test PASSED!"
@@ -99,7 +111,11 @@ jobs:
           $mkContent = Get-Content "Makefile" -Raw
           $target = if ($mkContent -match "$($env:CONFIG)-arm64-v8a") { "$($env:CONFIG)-arm64-v8a" } else { $env:CONFIG }
 
-          & $make $target -j $env:NUMBER_OF_PROCESSORS "ANDROID_NDK_ROOT=$($env:NDK_POSIX)" "NDKROOT=$($env:NDK_POSIX)" "APP_ABI=arm64-v8a" "STRIP=echo"
+          & $make $target -j $env:NUMBER_OF_PROCESSORS `
+            "ANDROID_NDK_ROOT=$($env:NDK_POSIX)" `
+            "NDKROOT=$($env:NDK_POSIX)" `
+            "APP_ABI=arm64-v8a" `
+            "STRIP=echo"
           $code = $LASTEXITCODE
 
           $libs = Get-ChildItem -Path (Resolve-Path "../../..") -Recurse -File -Include *.a, *.so -ErrorAction SilentlyContinue |
