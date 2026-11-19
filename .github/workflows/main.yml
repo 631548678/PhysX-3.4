@@ -56,7 +56,7 @@ jobs:
           $externalsRoot = (Resolve-Path "Externals").Path
           $allText = (Get-ChildItem -Path $targetDir -Recurse -File | ForEach-Object { Get-Content $_.FullName -Raw }) -join "`n"
           $ndkMatches = [regex]::Matches($allText, "Externals/(android-ndk-[a-zA-Z0-9._-]+)") |
-            ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique
+            ForEach-Object { $_.Groups.Value } | Select-Object -Unique
 
           if (-not $ndkMatches) {
             $ndkMatches = @("android-ndk-r9d", "android-ndk-r13b", "android-ndk-r16b")
@@ -70,7 +70,6 @@ jobs:
             }
             New-Item -ItemType Junction -Path $linkPath -Target $ndkWinPath | Out-Null
 
-            # 强校验 64 位 g++ 编译器通过联接路径确实可访问
             $expectedGxx = Join-Path $linkPath "toolchains\aarch64-linux-android-4.9\prebuilt\windows-x86_64\bin\aarch64-linux-android-g++.exe"
             if (-not (Test-Path $expectedGxx)) {
               Write-Error "Compiler not found via junction at: $expectedGxx"
@@ -114,6 +113,9 @@ jobs:
             $text = $text -replace "-D__ARM_ARCH_5[A-Z0-9_]*", ""
             $text = $text -replace "-march=armv7-a|-mfpu=neon|-mfloat-abi=softfp|-mthumb-interwork|-marm", ""
 
+            # 4. 注入 NDK r16b Unified Headers 路径，解决 stdint.h / math.h 找不到的问题
+            $text = $text -replace "(-isysroot\s+[^\s]+)", "`$1 -isystem ../../../../Externals/android-ndk-r9d/sysroot/usr/include -isystem ../../../../Externals/android-ndk-r9d/sysroot/usr/include/aarch64-linux-android -D__ANDROID_API__=21"
+
             if ($text -ne $orig) {
               Write-Host "Patched $($mk.Name)"
               Set-Content -Path $mk.FullName -Value $text -NoNewline
@@ -149,7 +151,6 @@ jobs:
           & $makeExe $target @makeArgs
           $buildExitCode = $LASTEXITCODE
 
-          # 兜底检查：若核心 PhysX 库已产出，重置退出码以忽略 Snippets 示例的编译失败
           $generatedLibs = Get-ChildItem -Path (Resolve-Path "../../..") -Recurse -File -Include *.a, *.so -ErrorAction SilentlyContinue |
             Where-Object { $_.FullName -match "android" -and $_.FullName -notmatch "[\\/](Externals|\.git)[\\/]" }
 
