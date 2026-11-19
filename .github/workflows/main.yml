@@ -38,6 +38,13 @@ jobs:
           $ndkWinPath = $env:RAW_NDK_PATH.TrimEnd('\', '/')
           $ndkPosixPath = $ndkWinPath -replace '\\', '/'
 
+          # 验证 NDK r16b Unified Headers 路径真实存在
+          $sysrootInc = "$ndkPosixPath/sysroot/usr/include"
+          if (-not (Test-Path "$sysrootInc/stdint.h")) {
+            Write-Error "Unified header stdint.h not found at $sysrootInc/stdint.h"
+          }
+          Write-Host "Verified Unified Headers at: $sysrootInc"
+
           $androidDirs = Get-ChildItem -Path "PhysX_3.4" -Recurse -Directory -Filter "android*" |
             Where-Object { $_.FullName -match "compiler" }
           if (-not $androidDirs) {
@@ -56,7 +63,7 @@ jobs:
           $externalsRoot = (Resolve-Path "Externals").Path
           $allText = (Get-ChildItem -Path $targetDir -Recurse -File | ForEach-Object { Get-Content $_.FullName -Raw }) -join "`n"
           $ndkMatches = [regex]::Matches($allText, "Externals/(android-ndk-[a-zA-Z0-9._-]+)") |
-            ForEach-Object { $_.Groups.Value } | Select-Object -Unique
+            ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique
 
           if (-not $ndkMatches) {
             $ndkMatches = @("android-ndk-r9d", "android-ndk-r13b", "android-ndk-r16b")
@@ -69,12 +76,6 @@ jobs:
               Remove-Item $linkPath -Force -Recurse
             }
             New-Item -ItemType Junction -Path $linkPath -Target $ndkWinPath | Out-Null
-
-            $expectedGxx = Join-Path $linkPath "toolchains\aarch64-linux-android-4.9\prebuilt\windows-x86_64\bin\aarch64-linux-android-g++.exe"
-            if (-not (Test-Path $expectedGxx)) {
-              Write-Error "Compiler not found via junction at: $expectedGxx"
-            }
-            Write-Host "Verified compiler exists: $expectedGxx"
           }
 
           $vars = @("ANDROID_NDK_ROOT", "NDK_ROOT", "ANDROID_NDK", "NDKROOT", "NDK_PATH")
@@ -89,7 +90,10 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $androidBuildDir = $env:PHYSX_ANDROID_DIR
+          $ndkPosix = $env:ANDROID_NDK_ROOT
           Write-Host "Working in: $androidBuildDir"
+
+          $unifiedFlags = "-isystem $ndkPosix/sysroot/usr/include -isystem $ndkPosix/sysroot/usr/include/aarch64-linux-android -D__ANDROID_API__=21"
 
           $allMakefiles = Get-ChildItem -Path $androidBuildDir -Recurse -File
           foreach ($mk in $allMakefiles) {
@@ -113,8 +117,10 @@ jobs:
             $text = $text -replace "-D__ARM_ARCH_5[A-Z0-9_]*", ""
             $text = $text -replace "-march=armv7-a|-mfpu=neon|-mfloat-abi=softfp|-mthumb-interwork|-marm", ""
 
-            # 4. 注入 NDK r16b Unified Headers 路径，解决 stdint.h / math.h 找不到的问题
-            $text = $text -replace "(-isysroot\s+[^\s]+)", "`$1 -isystem ../../../../Externals/android-ndk-r9d/sysroot/usr/include -isystem ../../../../Externals/android-ndk-r9d/sysroot/usr/include/aarch64-linux-android -D__ANDROID_API__=21"
+            # 4. 直接将 Unified Headers 注入到每个子 .mk 文件的 CPPFLAGS / CFLAGS / CXXFLAGS 中
+            if ($mk.Name -like "*.mk") {
+              $text = $text + "`nCPPFLAGS += $unifiedFlags`nCFLAGS += $unifiedFlags`nCXXFLAGS += $unifiedFlags`n"
+            }
 
             if ($text -ne $orig) {
               Write-Host "Patched $($mk.Name)"
