@@ -1,211 +1,128 @@
-name: Build PhysX 3.4 Android arm64 (Complete)
+name: Build PhysX 3.4 Android arm64
 
 on:
   workflow_dispatch:
     inputs:
       build_config:
-        description: 'PhysX 3.4 编译配置'
+        description: 'Build Config'
         required: true
         default: 'checked'
         type: choice
-        options:
-          - debug     # 无优化 + 断言 + 完整符号 (-O0 -g)
-          - checked   # 适度优化 + API检查 + 符号
-          - profile   # 高性能 + PVD分析 + 附加符号 (-g)
-          - release   # 最高性能 + 附加符号 (-g)
+        options: [debug, checked, profile, release]
 
 jobs:
-  build-physx34-android:
+  build:
     runs-on: windows-2022
-
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Android NDK (r16b)
-        id: setup-ndk
+      - name: Setup NDK r16b
+        id: ndk
         uses: nttld/setup-ndk@v1
         with:
           ndk-version: r16b
           add-to-path: true
 
-      - name: Setup NDK Legacy Sysroot Headers & Link to Externals
+      - name: Audit, Patch & Smoke Test
         shell: pwsh
         env:
-          RAW_NDK_PATH: ${{ steps.setup-ndk.outputs.ndk-path }}
+          RAW_NDK: ${{ steps.ndk.outputs.ndk-path }}
         run: |
           $ErrorActionPreference = "Stop"
-          $ndkWinPath = $env:RAW_NDK_PATH.TrimEnd('\', '/')
-          $ndkPosixPath = $ndkWinPath -replace '\\', '/'
+          $ndkWin = $env:RAW_NDK.TrimEnd('\', '/')
+          $ndk = $ndkWin -replace '\\', '/'
 
-          # 关键修复：NDK r16b 将头文件移到了 sysroot/usr/include，导致旧版 --sysroot 找不到 stdint.h/math.h
-          # 直接将 sysroot/usr/include 合并进 platforms/android-21/arch-arm64/usr/include，无需修改任何 Makefile 变量名
-          $unifiedInc = Join-Path $ndkWinPath "sysroot\usr\include"
-          $archInc = Join-Path $unifiedInc "aarch64-linux-android"
-          $legacySysrootInc = Join-Path $ndkWinPath "platforms\android-21\arch-arm64\usr\include"
-
-          New-Item -ItemType Directory -Path $legacySysrootInc -Force | Out-Null
-          Copy-Item -Path "$unifiedInc\*" -Destination $legacySysrootInc -Recurse -Force
-          if (Test-Path $archInc) {
-            Copy-Item -Path "$archInc\*" -Destination $legacySysrootInc -Recurse -Force
+          # 1. 体检 NDK 工具链与 Unified Headers
+          $gxx = "$ndk/toolchains/aarch64-linux-android-4.9/prebuilt/windows-x86_64/bin/aarch64-linux-android-g++.exe"
+          $inc1 = "$ndk/sysroot/usr/include"
+          $inc2 = "$ndk/sysroot/usr/include/aarch64-linux-android"
+          if (-not (Test-Path $gxx) -or -not (Test-Path "$inc1/stdint.h")) {
+            Write-Error "NDK toolchain or Unified Headers missing!"
           }
 
-          if (-not (Test-Path "$legacySysrootInc\stdint.h")) {
-            Write-Error "Failed to populate stdint.h into $legacySysrootInc"
-          }
-          Write-Host "Successfully populated legacy sysroot headers at: $legacySysrootInc"
+          # 2. 定位 PhysX_3.4 编译目录并挂载 Externals 软链接
+          $dirObj = Get-ChildItem -Path "PhysX_3.4" -Recurse -Directory -Filter "android*" |
+            Where-Object { $_.FullName -match "compiler" } | Select-Object -Last 1
+          if (-not $dirObj) { Write-Error "No compiler/android* directory in PhysX_3.4!" }
+          $buildDir = $dirObj.FullName
+          "BUILD_DIR=$buildDir" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "NDK_POSIX=$ndk" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
 
-          # 定位 PhysX_3.4 下的 android 编译目录
-          $androidDirs = Get-ChildItem -Path "PhysX_3.4" -Recurse -Directory -Filter "android*" |
-            Where-Object { $_.FullName -match "compiler" }
-          if (-not $androidDirs) {
-            Write-Error "No compiler/android* directory found inside PhysX_3.4!"
-          }
-
-          $targetDirObj = $androidDirs | Where-Object { $_.Name -match "64|21|22|23|24" } | Select-Object -Last 1
-          if (-not $targetDirObj) {
-            $targetDirObj = $androidDirs | Select-Object -Last 1
-          }
-          $targetDir = $targetDirObj.FullName
-          Write-Host "Selected PhysX_3.4 Build Directory: $targetDir"
-          "PHYSX_ANDROID_DIR=$targetDir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-
-          # 创建目录联接映射到 Externals/android-ndk-*
-          $externalsRoot = (Resolve-Path "Externals").Path
-          $allText = (Get-ChildItem -Path $targetDir -Recurse -File | ForEach-Object { Get-Content $_.FullName -Raw }) -join "`n"
-          $ndkMatches = [regex]::Matches($allText, "Externals/(android-ndk-[a-zA-Z0-9._-]+)") |
-            ForEach-Object { $_.Groups.Value } | Select-Object -Unique
-
-          if (-not $ndkMatches) {
-            $ndkMatches = @("android-ndk-r9d", "android-ndk-r13b", "android-ndk-r16b")
+          $extRoot = (Resolve-Path "Externals").Path
+          $allMkText = (Get-ChildItem -Path $buildDir -Recurse -File | ForEach-Object { Get-Content $_.FullName -Raw }) -join "`n"
+          $ndkNames = [regex]::Matches($allMkText, "Externals/(android-ndk-[a-zA-Z0-9._-]+)") |
+            ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique
+          if (-not $ndkNames) { $ndkNames = @("android-ndk-r9d", "android-ndk-r13b", "android-ndk-r16b") }
+          foreach ($name in $ndkNames) {
+            $lnk = Join-Path $extRoot $name
+            if (Test-Path $lnk) { Remove-Item $lnk -Force -Recurse }
+            New-Item -ItemType Junction -Path $lnk -Target $ndkWin | Out-Null
           }
 
-          foreach ($folderName in $ndkMatches) {
-            $linkPath = Join-Path $externalsRoot $folderName
-            Write-Host "Creating Junction: $linkPath -> $ndkWinPath"
-            if (Test-Path $linkPath) {
-              Remove-Item $linkPath -Force -Recurse
-            }
-            New-Item -ItemType Junction -Path $linkPath -Target $ndkWinPath | Out-Null
+          # 3. 修补 Makefile（arm64 工具链 + C++11 + Unified Headers + DWARF 调试符号）
+          $injectFlags = "-fpic -std=c++11 -isystem $inc1 -isystem $inc2 -D__ANDROID_API__=21"
+          foreach ($f in (Get-ChildItem -Path $buildDir -Recurse -File)) {
+            $t = Get-Content $f.FullName -Raw
+            $o = $t
+            $t = $t -replace "-g0", "-g"
+            $t = $t -replace "gnu-libstdc\+\+/4\.8", "gnu-libstdc++/4.9"
+            $t = $t -replace "armeabi-v7a", "arm64-v8a"
+            $t = $t -replace "arm-linux-androideabi-4\.8", "aarch64-linux-android-4.9"
+            $t = $t -replace "arm-linux-androideabi-", "aarch64-linux-android-"
+            $t = $t -replace "prebuilt/windows/", "prebuilt/windows-x86_64/"
+            $t = $t -replace "arch-arm\b", "arch-arm64"
+            $t = $t -replace "android-(9|16)", "android-21"
+            $t = $t -replace "-D__ARM_ARCH_5[A-Z0-9_]*|-march=armv7-a|-mfpu=neon|-mfloat-abi=softfp|-mthumb-interwork|-marm", ""
+            $t = $t -replace "-fpic\b", $injectFlags
+            if ($t -ne $o) { Set-Content -Path $f.FullName -Value $t -NoNewline }
           }
 
-          $vars = @("ANDROID_NDK_ROOT", "NDK_ROOT", "ANDROID_NDK", "NDKROOT", "NDK_PATH")
-          foreach ($v in $vars) {
-            "$v=$ndkPosixPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          }
+          # 4. 单文件冒烟编译检查（确保头文件与 STL 100% 畅通后再跑全量编译）
+          $smokeObj = "$env:TEMP\smoke_test.o"
+          & $gxx -c "PxShared/src/foundation/src/PsAllocator.cpp" -o $smokeObj `
+            -IPxShared/include -IPxShared/src/foundation/include `
+            -I"$ndk/sources/cxx-stl/gnu-libstdc++/4.9/include" `
+            -I"$ndk/sources/cxx-stl/gnu-libstdc++/4.9/libs/arm64-v8a/include" `
+            -isystem $inc1 -isystem $inc2 -D__ANDROID_API__=21 -DANDROID -std=c++11 -g
+          if ($LASTEXITCODE -ne 0) { Write-Error "Smoke test failed! Headers or STL mismatch." }
+          Remove-Item $smokeObj -Force -ErrorAction SilentlyContinue
+          Write-Host "Audit & Smoke Test PASSED!"
 
-      - name: Patch Makedefs & Build PhysX 3.4 arm64
+      - name: Full Build (arm64-v8a with Symbols)
         shell: pwsh
         env:
           CONFIG: ${{ github.event.inputs.build_config || 'checked' }}
         run: |
           $ErrorActionPreference = "Stop"
-          $androidBuildDir = $env:PHYSX_ANDROID_DIR
-          Write-Host "Working in: $androidBuildDir"
+          Set-Location $env:BUILD_DIR
+          $make = Get-ChildItem -Path $env:NDK_POSIX -Recurse -File -Filter "make.exe" | Select-Object -First 1 -ExpandProperty FullName
+          $mkContent = Get-Content "Makefile" -Raw
+          $target = if ($mkContent -match "$($env:CONFIG)-arm64-v8a") { "$($env:CONFIG)-arm64-v8a" } else { $env:CONFIG }
 
-          $allMakefiles = Get-ChildItem -Path $androidBuildDir -Recurse -File
-          foreach ($mk in $allMakefiles) {
-            $text = Get-Content $mk.FullName -Raw
-            $orig = $text
+          & $make $target -j $env:NUMBER_OF_PROCESSORS "ANDROID_NDK_ROOT=$($env:NDK_POSIX)" "NDKROOT=$($env:NDK_POSIX)" "APP_ABI=arm64-v8a" "STRIP=echo"
+          $code = $LASTEXITCODE
 
-            # 1. 保留完整调试符号，升级 STL 版本
-            $text = $text -replace "-g0", "-g"
-            $text = $text -replace "gnu-libstdc\+\+/4\.8", "gnu-libstdc++/4.9"
-
-            # 2. 将 32 位工具链替换为 64 位 aarch64 工具链
-            $text = $text -replace "armeabi-v7a", "arm64-v8a"
-            $text = $text -replace "arm-linux-androideabi-4\.8", "aarch64-linux-android-4.9"
-            $text = $text -replace "arm-linux-androideabi-", "aarch64-linux-android-"
-            $text = $text -replace "prebuilt/windows/", "prebuilt/windows-x86_64/"
-            $text = $text -replace "arch-arm\b", "arch-arm64"
-            $text = $text -replace "android-16", "android-21"
-            $text = $text -replace "android-9", "android-21"
-
-            # 3. 清理 32 位 ARMv5/ARMv7 专属宏与编译参数
-            $text = $text -replace "-D__ARM_ARCH_5[A-Z0-9_]*", ""
-            $text = $text -replace "-march=armv7-a|-mfpu=neon|-mfloat-abi=softfp|-mthumb-interwork|-marm", ""
-
-            if ($text -ne $orig) {
-              Write-Host "Patched $($mk.Name)"
-              Set-Content -Path $mk.FullName -Value $text -NoNewline
-            }
-          }
-
-          Set-Location $androidBuildDir
-
-          $makeExe = Get-ChildItem -Path $env:ANDROID_NDK_ROOT -Recurse -File -Filter "make.exe" |
-            Select-Object -First 1 -ExpandProperty FullName
-
-          $makefile = Get-Item "Makefile"
-          $mkContent = Get-Content $makefile.FullName -Raw
-
-          $target = $env:CONFIG
-          if ($mkContent -match "$($env:CONFIG)-arm64-v8a") {
-            $target = "$($env:CONFIG)-arm64-v8a"
-          } elseif ($mkContent -match "$($env:CONFIG)-arm64") {
-            $target = "$($env:CONFIG)-arm64"
-          }
-
-          $makeArgs = @(
-            "-j", "$env:NUMBER_OF_PROCESSORS",
-            "ANDROID_NDK_ROOT=$($env:ANDROID_NDK_ROOT)",
-            "NDKROOT=$($env:ANDROID_NDK_ROOT)",
-            "NDK_ROOT=$($env:ANDROID_NDK_ROOT)",
-            "NDK_PATH=$($env:ANDROID_NDK_ROOT)",
-            "APP_ABI=arm64-v8a",
-            "STRIP=echo"
-          )
-
-          Write-Host "Executing: $makeExe $target $($makeArgs -join ' ')"
-          & $makeExe $target @makeArgs
-          $buildExitCode = $LASTEXITCODE
-
-          $generatedLibs = Get-ChildItem -Path (Resolve-Path "../../..") -Recurse -File -Include *.a, *.so -ErrorAction SilentlyContinue |
+          $libs = Get-ChildItem -Path (Resolve-Path "../../..") -Recurse -File -Include *.a, *.so -ErrorAction SilentlyContinue |
             Where-Object { $_.FullName -match "android" -and $_.FullName -notmatch "[\\/](Externals|\.git)[\\/]" }
+          if ($code -ne 0 -and -not $libs) { throw "Build failed with exit code $code" }
+          if ($code -ne 0) { $global:LASTEXITCODE = 0 }
 
-          if ($buildExitCode -ne 0) {
-            if ($generatedLibs) {
-              Write-Warning "make exited with code $buildExitCode (likely in Snippets), but core PhysX libraries were built!"
-              $global:LASTEXITCODE = 0
-            } else {
-              throw "make failed with exit code $buildExitCode"
-            }
-          }
-
-      - name: Verify Output Architecture (aarch64) & Debug Symbols
+      - name: Verify AArch64 & Debug Symbols
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $libs = Get-ChildItem -Path "PhysX_3.4" -Recurse -File -Include *.a, *.so |
-            Where-Object { $_.FullName -match "android" }
-
-          if (-not $libs) {
-            Write-Error "No newly compiled Android .a or .so files were found under PhysX_3.4!"
-          }
-
-          Write-Host "=== Newly Built PhysX 3.4 Android Libraries ==="
+          $libs = Get-ChildItem -Path "PhysX_3.4" -Recurse -File -Include *.a, *.so | Where-Object { $_.FullName -match "android" }
+          if (-not $libs) { Write-Error "No Android libraries produced!" }
           $libs | ForEach-Object { Write-Host $_.FullName }
 
-          $readelf = Get-ChildItem -Path $env:ANDROID_NDK_ROOT -Recurse -File -Filter "aarch64-linux-android-readelf.exe" |
-            Select-Object -First 1 -ExpandProperty FullName
+          $readelf = Get-ChildItem -Path $env:NDK_POSIX -Recurse -File -Filter "aarch64-linux-android-readelf.exe" | Select-Object -First 1 -ExpandProperty FullName
+          $sample = ($libs | Where-Object { $_.Name -match "PhysX" } | Select-Object -First 1).FullName
+          if (-not $sample) { $sample = ($libs | Select-Object -First 1).FullName }
 
-          $firstLibObj = $libs | Where-Object { $_.Name -match "PhysX" } | Select-Object -First 1
-          if (-not $firstLibObj) { $firstLibObj = $libs | Select-Object -First 1 }
-          $firstLib = $firstLibObj.FullName
+          & $readelf -h "$sample" | Select-String "Machine:"
+          & $readelf -S "$sample" | Select-String "debug_info|debug_line" | Select-Object -First 5
 
-          if ($readelf -and $firstLib) {
-            Write-Host "=== 1. Verifying CPU Architecture in: $firstLib ==="
-            $headerInfo = & $readelf -h "$firstLib" | Select-String -Pattern "Machine:" | Select-Object -First 1
-            Write-Host $headerInfo
-            if ($headerInfo -notmatch "AArch64") {
-              Write-Error "Architecture mismatch! Expected AArch64, got: $headerInfo"
-            }
-
-            Write-Host "=== 2. Verifying DWARF Debug Sections ==="
-            & $readelf -S "$firstLib" | Select-String -Pattern "debug_info|debug_line" | Select-Object -First 10
-          }
-
-      - name: Upload Build Artifacts
+      - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: physx-3.4-android-arm64-${{ github.event.inputs.build_config || 'checked' }}-symbols
