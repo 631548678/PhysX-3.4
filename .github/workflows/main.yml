@@ -29,7 +29,7 @@ jobs:
           ndk-version: r16b
           add-to-path: true
 
-      - name: Inspect PhysX_3.4 Android Directories & Link NDK to Externals
+      - name: Setup NDK Legacy Sysroot Headers & Link to Externals
         shell: pwsh
         env:
           RAW_NDK_PATH: ${{ steps.setup-ndk.outputs.ndk-path }}
@@ -38,13 +38,24 @@ jobs:
           $ndkWinPath = $env:RAW_NDK_PATH.TrimEnd('\', '/')
           $ndkPosixPath = $ndkWinPath -replace '\\', '/'
 
-          # 验证 NDK r16b Unified Headers 路径真实存在
-          $sysrootInc = "$ndkPosixPath/sysroot/usr/include"
-          if (-not (Test-Path "$sysrootInc/stdint.h")) {
-            Write-Error "Unified header stdint.h not found at $sysrootInc/stdint.h"
-          }
-          Write-Host "Verified Unified Headers at: $sysrootInc"
+          # 关键修复：NDK r16b 将头文件移到了 sysroot/usr/include，导致旧版 --sysroot 找不到 stdint.h/math.h
+          # 直接将 sysroot/usr/include 合并进 platforms/android-21/arch-arm64/usr/include，无需修改任何 Makefile 变量名
+          $unifiedInc = Join-Path $ndkWinPath "sysroot\usr\include"
+          $archInc = Join-Path $unifiedInc "aarch64-linux-android"
+          $legacySysrootInc = Join-Path $ndkWinPath "platforms\android-21\arch-arm64\usr\include"
 
+          New-Item -ItemType Directory -Path $legacySysrootInc -Force | Out-Null
+          Copy-Item -Path "$unifiedInc\*" -Destination $legacySysrootInc -Recurse -Force
+          if (Test-Path $archInc) {
+            Copy-Item -Path "$archInc\*" -Destination $legacySysrootInc -Recurse -Force
+          }
+
+          if (-not (Test-Path "$legacySysrootInc\stdint.h")) {
+            Write-Error "Failed to populate stdint.h into $legacySysrootInc"
+          }
+          Write-Host "Successfully populated legacy sysroot headers at: $legacySysrootInc"
+
+          # 定位 PhysX_3.4 下的 android 编译目录
           $androidDirs = Get-ChildItem -Path "PhysX_3.4" -Recurse -Directory -Filter "android*" |
             Where-Object { $_.FullName -match "compiler" }
           if (-not $androidDirs) {
@@ -59,11 +70,11 @@ jobs:
           Write-Host "Selected PhysX_3.4 Build Directory: $targetDir"
           "PHYSX_ANDROID_DIR=$targetDir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-          # 扫描所有 Makefile 中引用的 Externals/android-ndk-* 名称，全部创建目录联接
+          # 创建目录联接映射到 Externals/android-ndk-*
           $externalsRoot = (Resolve-Path "Externals").Path
           $allText = (Get-ChildItem -Path $targetDir -Recurse -File | ForEach-Object { Get-Content $_.FullName -Raw }) -join "`n"
           $ndkMatches = [regex]::Matches($allText, "Externals/(android-ndk-[a-zA-Z0-9._-]+)") |
-            ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique
+            ForEach-Object { $_.Groups.Value } | Select-Object -Unique
 
           if (-not $ndkMatches) {
             $ndkMatches = @("android-ndk-r9d", "android-ndk-r13b", "android-ndk-r16b")
@@ -90,10 +101,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $androidBuildDir = $env:PHYSX_ANDROID_DIR
-          $ndkPosix = $env:ANDROID_NDK_ROOT
           Write-Host "Working in: $androidBuildDir"
-
-          $unifiedFlags = "-isystem $ndkPosix/sysroot/usr/include -isystem $ndkPosix/sysroot/usr/include/aarch64-linux-android -D__ANDROID_API__=21"
 
           $allMakefiles = Get-ChildItem -Path $androidBuildDir -Recurse -File
           foreach ($mk in $allMakefiles) {
@@ -116,11 +124,6 @@ jobs:
             # 3. 清理 32 位 ARMv5/ARMv7 专属宏与编译参数
             $text = $text -replace "-D__ARM_ARCH_5[A-Z0-9_]*", ""
             $text = $text -replace "-march=armv7-a|-mfpu=neon|-mfloat-abi=softfp|-mthumb-interwork|-marm", ""
-
-            # 4. 直接将 Unified Headers 注入到每个子 .mk 文件的 CPPFLAGS / CFLAGS / CXXFLAGS 中
-            if ($mk.Name -like "*.mk") {
-              $text = $text + "`nCPPFLAGS += $unifiedFlags`nCFLAGS += $unifiedFlags`nCXXFLAGS += $unifiedFlags`n"
-            }
 
             if ($text -ne $orig) {
               Write-Host "Patched $($mk.Name)"
