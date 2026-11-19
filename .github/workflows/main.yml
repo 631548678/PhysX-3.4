@@ -1,4 +1,4 @@
-name: Build PhysX 3.4 Android arm64 (Diagnostic & Build)
+name: Build PhysX 3.4 Android arm64 (Official Structure)
 
 on:
   workflow_dispatch:
@@ -22,6 +22,7 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
+      # 锁定 NDK r16b：完整支持 arm64-v8a (android-21) 且保留 gnu-libstdc++ 4.9
       - name: Setup Android NDK (r16b)
         id: setup-ndk
         uses: nttld/setup-ndk@v1
@@ -29,68 +30,103 @@ jobs:
           ndk-version: r16b
           add-to-path: true
 
-      - name: Configure Environment
+      - name: Inspect PhysX_3.4 Android Directories & Link NDK to Externals
         shell: pwsh
         env:
           RAW_NDK_PATH: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
           $ErrorActionPreference = "Stop"
-          $ndkPath = ($env:RAW_NDK_PATH -replace '\\', '/').TrimEnd('/')
-          $vars = @("ANDROID_NDK_ROOT", "NDK_ROOT", "ANDROID_NDK", "NDKROOT", "NDK_HOME")
-          foreach ($v in $vars) {
-            "$v=$ndkPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          }
-          Write-Host "Resolved NDK Path: $ndkPath"
+          $ndkWinPath = $env:RAW_NDK_PATH
+          $ndkPosixPath = ($ndkWinPath -replace '\\', '/').TrimEnd('/')
 
-      - name: Patch & Build PhysX 3.4 Android arm64
+          Write-Host "=== Searching all compiler/android* directories in PhysX_3.4 ==="
+          $androidDirs = Get-ChildItem -Path "PhysX_3.4" -Recurse -Directory -Filter "android*" |
+            Where-Object { $_.FullName -match "compiler" }
+          $androidDirs | ForEach-Object { Write-Host $_.FullName }
+
+          if (-not $androidDirs) {
+            Write-Error "No compiler/android* directory found inside PhysX_3.4!"
+          }
+
+          # 优先选择包含 64 或 21/22/23/24 的目录（Android arm64 从 API 21 开始支持），否则取最后一个
+          $targetDirObj = $androidDirs | Where-Object { $_.Name -match "64|21|22|23|24" } | Select-Object -Last 1
+          if (-not $targetDirObj) {
+            $targetDirObj = $androidDirs | Select-Object -Last 1
+          }
+          $targetDir = $targetDirObj.FullName
+          Write-Host "Selected PhysX_3.4 Build Directory: $targetDir"
+          "PHYSX_ANDROID_DIR=$targetDir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          # 读取 Makedefs.ANDROID.mk 查看它期望的 Externals 下的 NDK 目录名（例如 android-ndk-r9d 或 android-ndk-r13b）
+          $makedefs = Get-ChildItem -Path $targetDir -Recurse -File -Filter "Makedefs*" | Select-Object -First 1
+          if ($makedefs) {
+            Write-Host "=== Preview of $($makedefs.Name) ==="
+            Get-Content $makedefs.FullName -TotalCount 60
+
+            $mkText = Get-Content $makedefs.FullName -Raw
+            if ($mkText -match "Externals/(android-ndk-[a-zA-Z0-9._-]+)") {
+              $expectedNdkFolderName = $Matches[1]
+              $externalsNdkPath = Join-Path (Resolve-Path "Externals") $expectedNdkFolderName
+              Write-Host "Detected expected NDK path in Externals: $externalsNdkPath"
+              if (-not (Test-Path $externalsNdkPath)) {
+                New-Item -ItemType Directory -Path (Split-Path $externalsNdkPath) -Force | Out-Null
+                # 创建目录联接（Junction）将 NDK 映射到 Externals 下，秒级完成且无需拷贝数 GB 文件
+                cmd /c mklink /J "`"$externalsNdkPath`"" "`"$ndkWinPath`""
+              }
+            }
+          }
+
+          # 同时导出常见环境变量
+          $vars = @("ANDROID_NDK_ROOT", "NDK_ROOT", "ANDROID_NDK", "NDKROOT", "NDK_PATH", "PM_AndroidNDK_PATH")
+          foreach ($v in $vars) {
+            "$v=$ndkPosixPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          }
+
+      - name: Patch Makedefs & Build PhysX 3.4 arm64
         shell: pwsh
         env:
           CONFIG: ${{ github.event.inputs.build_config || 'checked' }}
         run: |
           $ErrorActionPreference = "Stop"
+          $androidBuildDir = $env:PHYSX_ANDROID_DIR
+          Write-Host "Working in: $androidBuildDir"
 
-          $makefile = Get-ChildItem -Recurse -File -Filter "Makefile" |
-            Where-Object { $_.DirectoryName -match "compiler[\\/]android" } |
-            Select-Object -First 1
-
-          if (-not $makefile) {
-            Write-Error "Could not find Android Makefile under compiler/android!"
-          }
-
-          $androidBuildDir = $makefile.DirectoryName
-          Write-Host "=== Files inside $androidBuildDir ==="
-          Get-ChildItem -Path $androidBuildDir -Recurse | Select-Object FullName
-
-          # 1. 自动把 Application.mk / Makefile 中的 armeabi-v7a 替换为 arm64-v8a，并保留 -g 符号
+          # 修补 Makedefs 和子 Makefile：
+          # 1. 保留 -g 调试符号
+          # 2. 将旧版 gnu-libstdc++/4.8 替换为 NDK r16b 实际包含的 4.9
+          # 3. 若选中的目录只有 32 位配置，强制升级为 arm64-v8a + android-21 + aarch64-linux-android
           $allMakefiles = Get-ChildItem -Path $androidBuildDir -Recurse -File
           foreach ($mk in $allMakefiles) {
             $text = Get-Content $mk.FullName -Raw
-            $modified = $false
-            if ($text -match "armeabi-v7a") {
-              Write-Host "Patching armeabi-v7a -> arm64-v8a in $($mk.Name)"
+            $orig = $text
+
+            $text = $text -replace "-g0", "-g"
+            $text = $text -replace "gnu-libstdc\+\+/4\.8", "gnu-libstdc++/4.9"
+
+            if ($text -match "armeabi-v7a" -and $text -notmatch "arm64-v8a") {
               $text = $text -replace "armeabi-v7a", "arm64-v8a"
-              $modified = $true
+              $text = $text -replace "arm-linux-androideabi", "aarch64-linux-android"
+              $text = $text -replace "arch-arm\b", "arch-arm64"
+              $text = $text -replace "android-16", "android-21"
+              $text = $text -replace "-march=armv7-a|-mfpu=neon|-mfloat-abi=softfp|-mthumb-interwork|-marm", ""
             }
-            if ($text -match "-g0") {
-              Write-Host "Patching -g0 -> -g in $($mk.Name)"
-              $text = $text -replace "-g0", "-g"
-              $modified = $true
-            }
-            if ($modified) {
+
+            if ($text -ne $orig) {
+              Write-Host "Patched $($mk.Name)"
               Set-Content -Path $mk.FullName -Value $text -NoNewline
             }
           }
 
-          Write-Host "=== Top-level Makefile Content ==="
-          Get-Content $makefile.FullName
-
           Set-Location $androidBuildDir
 
-          # 2. 定位 NDK 自带的 make.exe
           $makeExe = Get-ChildItem -Path $env:ANDROID_NDK_ROOT -Recurse -File -Filter "make.exe" |
             Select-Object -First 1 -ExpandProperty FullName
 
+          $makefile = Get-Item "Makefile"
           $mkContent = Get-Content $makefile.FullName -Raw
+          Write-Host "=== Top-level Makefile ==="
+          Write-Host $mkContent
+
           $target = $env:CONFIG
           if ($mkContent -match "$($env:CONFIG)-arm64-v8a") {
             $target = "$($env:CONFIG)-arm64-v8a"
@@ -103,6 +139,7 @@ jobs:
             "ANDROID_NDK_ROOT=$($env:ANDROID_NDK_ROOT)",
             "NDKROOT=$($env:ANDROID_NDK_ROOT)",
             "NDK_ROOT=$($env:ANDROID_NDK_ROOT)",
+            "NDK_PATH=$($env:ANDROID_NDK_ROOT)",
             "APP_ABI=arm64-v8a",
             "STRIP=echo"
           )
@@ -117,18 +154,14 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          # 仅搜索 android 目录下的新编译产物，排除 Externals 和 linux64
-          $libs = Get-ChildItem -Recurse -File -Include *.a, *.so |
-            Where-Object {
-              $_.FullName -match "android" -and
-              $_.FullName -notmatch "[\\/](Externals|\.git)[\\/]"
-            }
+          $libs = Get-ChildItem -Path "PhysX_3.4" -Recurse -File -Include *.a, *.so |
+            Where-Object { $_.FullName -match "android" }
 
           if (-not $libs) {
-            Write-Error "No newly compiled Android .a or .so files were found!"
+            Write-Error "No newly compiled Android .a or .so files were found under PhysX_3.4!"
           }
 
-          Write-Host "=== Newly Built Android Libraries ==="
+          Write-Host "=== Newly Built PhysX 3.4 Android Libraries ==="
           $libs | ForEach-Object { Write-Host $_.FullName }
 
           $readelf = Get-ChildItem -Path $env:ANDROID_NDK_ROOT -Recurse -File -Filter "aarch64-linux-android-readelf.exe" |
