@@ -1,4 +1,4 @@
-name: Build PhysX 3.4 Android arm64 (Hardened)
+name: Build PhysX 3.4 Android arm64 (Diagnostic & Build)
 
 on:
   workflow_dispatch:
@@ -9,10 +9,10 @@ on:
         default: 'checked'
         type: choice
         options:
-          - debug     # 无优化 + 断言 + 完整符号 (-O0 -g)
-          - checked   # 适度优化 + API检查 + 符号
-          - profile   # 高性能 + PVD分析 + 附加符号 (-g)
-          - release   # 最高性能 + 附加符号 (-g)
+          - debug
+          - checked
+          - profile
+          - release
 
 jobs:
   build-physx34-android:
@@ -22,7 +22,6 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      # 锁定 NDK r16b：完整支持 arm64-v8a 且保留 PhysX 3.4 默认依赖的 gnustl_static
       - name: Setup Android NDK (r16b)
         id: setup-ndk
         uses: nttld/setup-ndk@v1
@@ -30,37 +29,26 @@ jobs:
           ndk-version: r16b
           add-to-path: true
 
-      - name: Configure Environment & Inspect Repo
+      - name: Configure Environment
         shell: pwsh
         env:
           RAW_NDK_PATH: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
           $ErrorActionPreference = "Stop"
-          # 强制转为正斜杠，防止 GNU Make 在 Windows 下因反斜杠转义失败
           $ndkPath = ($env:RAW_NDK_PATH -replace '\\', '/').TrimEnd('/')
-
-          if (-not (Test-Path $ndkPath)) {
-            Write-Error "NDK path does not exist: $ndkPath"
-          }
-
-          # 导出 PhysX 3.4 顶层及子 Makefile 可能读取的所有 NDK 变量名
           $vars = @("ANDROID_NDK_ROOT", "NDK_ROOT", "ANDROID_NDK", "NDKROOT", "NDK_HOME")
           foreach ($v in $vars) {
             "$v=$ndkPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           }
-
           Write-Host "Resolved NDK Path: $ndkPath"
-          Write-Host "=== Searching android directories in repo ==="
-          Get-ChildItem -Recurse -Directory -Filter "*android*" | Select-Object FullName
 
-      - name: Patch Makefiles for Debug Symbols & Build arm64
+      - name: Patch & Build PhysX 3.4 Android arm64
         shell: pwsh
         env:
           CONFIG: ${{ github.event.inputs.build_config || 'checked' }}
         run: |
           $ErrorActionPreference = "Stop"
 
-          # 1. 定位 Android 顶层 Makefile
           $makefile = Get-ChildItem -Recurse -File -Filter "Makefile" |
             Where-Object { $_.DirectoryName -match "compiler[\\/]android" } |
             Select-Object -First 1
@@ -70,15 +58,25 @@ jobs:
           }
 
           $androidBuildDir = $makefile.DirectoryName
-          Write-Host "Found Android Build Directory: $androidBuildDir"
+          Write-Host "=== Files inside $androidBuildDir ==="
+          Get-ChildItem -Path $androidBuildDir -Recurse | Select-Object FullName
 
-          # 2. 强制确保所有子 Makefile 保留 -g 调试符号（防止 release/profile 下硬编码 -g0 覆盖）
-          $allMakefiles = Get-ChildItem -Path $androidBuildDir -Recurse -File -Include "Makefile", "*.mk"
+          # 1. 自动把 Application.mk / Makefile 中的 armeabi-v7a 替换为 arm64-v8a，并保留 -g 符号
+          $allMakefiles = Get-ChildItem -Path $androidBuildDir -Recurse -File
           foreach ($mk in $allMakefiles) {
             $text = Get-Content $mk.FullName -Raw
+            $modified = $false
+            if ($text -match "armeabi-v7a") {
+              Write-Host "Patching armeabi-v7a -> arm64-v8a in $($mk.Name)"
+              $text = $text -replace "armeabi-v7a", "arm64-v8a"
+              $modified = $true
+            }
             if ($text -match "-g0") {
               Write-Host "Patching -g0 -> -g in $($mk.Name)"
               $text = $text -replace "-g0", "-g"
+              $modified = $true
+            }
+            if ($modified) {
               Set-Content -Path $mk.FullName -Value $text -NoNewline
             }
           }
@@ -88,98 +86,76 @@ jobs:
 
           Set-Location $androidBuildDir
 
-          # 3. 定位 NDK 自带的 make.exe
+          # 2. 定位 NDK 自带的 make.exe
           $makeExe = Get-ChildItem -Path $env:ANDROID_NDK_ROOT -Recurse -File -Filter "make.exe" |
             Select-Object -First 1 -ExpandProperty FullName
-          if (-not $makeExe) {
-            Write-Error "Could not find make.exe inside NDK ($env:ANDROID_NDK_ROOT)!"
-          }
 
-          # 4. 构造独立的 Make 参数数组（严禁合并为带空格的单字符串）
           $mkContent = Get-Content $makefile.FullName -Raw
           $target = $env:CONFIG
+          if ($mkContent -match "$($env:CONFIG)-arm64-v8a") {
+            $target = "$($env:CONFIG)-arm64-v8a"
+          } elseif ($mkContent -match "$($env:CONFIG)-arm64") {
+            $target = "$($env:CONFIG)-arm64"
+          }
+
           $makeArgs = @(
             "-j", "$env:NUMBER_OF_PROCESSORS",
             "ANDROID_NDK_ROOT=$($env:ANDROID_NDK_ROOT)",
             "NDKROOT=$($env:ANDROID_NDK_ROOT)",
             "NDK_ROOT=$($env:ANDROID_NDK_ROOT)",
+            "APP_ABI=arm64-v8a",
             "STRIP=echo"
           )
 
-          # 根据 Makefile 实际定义自动适配 arm64 目标名或 ABI 参数
-          if ($mkContent -match "$($env:CONFIG)-arm64-v8a") {
-            $target = "$($env:CONFIG)-arm64-v8a"
-          } elseif ($mkContent -match "$($env:CONFIG)-arm64") {
-            $target = "$($env:CONFIG)-arm64"
-          } elseif ($mkContent -match "arm64-v8a") {
-            $makeArgs += @("APP_ABI=arm64-v8a", "ARCH=arm64", "TARGET_ARCH=arm64")
-          } else {
-            $makeArgs += @("APP_ABI=arm64-v8a", "ARCH=arm64")
-          }
-
           Write-Host "Executing: $makeExe $target $($makeArgs -join ' ')"
           & $makeExe $target @makeArgs
-          $buildExitCode = $LASTEXITCODE
-
-          # 5. 兜底检查：若核心 PhysX 库已成功产出，则重置 LASTEXITCODE 忽略 Snippets 示例的编译失败
-          $generatedLibs = Get-ChildItem -Path (Resolve-Path "../../..") -Recurse -File -Include *.a, *.so -ErrorAction SilentlyContinue |
-            Where-Object { $_.FullName -notmatch "[\\/]\.git[\\/]" -and $_.Name -match "PhysX" }
-
-          if ($buildExitCode -ne 0) {
-            if ($generatedLibs) {
-              Write-Warning "make exited with code $buildExitCode (likely in Snippets/Samples), but core PhysX libraries were built successfully!"
-              $global:LASTEXITCODE = 0
-            } else {
-              throw "make failed with exit code $buildExitCode and no PhysX libraries were produced."
-            }
+          if ($LASTEXITCODE -ne 0) {
+            throw "make failed with exit code $LASTEXITCODE"
           }
 
       - name: Verify Output Architecture (aarch64) & Debug Symbols
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          Write-Host "=== Searching compiled libraries (.a / .so) ==="
+          # 仅搜索 android 目录下的新编译产物，排除 Externals 和 linux64
           $libs = Get-ChildItem -Recurse -File -Include *.a, *.so |
-            Where-Object { $_.FullName -notmatch "[\\/]\.git[\\/]" }
+            Where-Object {
+              $_.FullName -match "android" -and
+              $_.FullName -notmatch "[\\/](Externals|\.git)[\\/]"
+            }
 
           if (-not $libs) {
-            Write-Error "No .a or .so files were generated!"
+            Write-Error "No newly compiled Android .a or .so files were found!"
           }
 
+          Write-Host "=== Newly Built Android Libraries ==="
           $libs | ForEach-Object { Write-Host $_.FullName }
 
           $readelf = Get-ChildItem -Path $env:ANDROID_NDK_ROOT -Recurse -File -Filter "aarch64-linux-android-readelf.exe" |
             Select-Object -First 1 -ExpandProperty FullName
 
           $firstLibObj = $libs | Where-Object { $_.Name -match "PhysX" } | Select-Object -First 1
-          if (-not $firstLibObj) {
-            $firstLibObj = $libs | Select-Object -First 1
-          }
+          if (-not $firstLibObj) { $firstLibObj = $libs | Select-Object -First 1 }
           $firstLib = $firstLibObj.FullName
 
           if ($readelf -and $firstLib) {
-            Write-Host "=== 1. Verifying CPU Architecture (Must be AArch64) in: $firstLib ==="
+            Write-Host "=== 1. Verifying CPU Architecture in: $firstLib ==="
             $headerInfo = & $readelf -h "$firstLib" | Select-String -Pattern "Machine:" | Select-Object -First 1
             Write-Host $headerInfo
             if ($headerInfo -notmatch "AArch64") {
-              Write-Error "Architecture mismatch! Expected AArch64 (arm64-v8a), but got: $headerInfo"
+              Write-Error "Architecture mismatch! Expected AArch64, got: $headerInfo"
             }
 
-            Write-Host "=== 2. Verifying DWARF Debug Sections in: $firstLib ==="
-            $debugSections = & $readelf -S "$firstLib" | Select-String -Pattern "debug_info|debug_line"
-            if (-not $debugSections) {
-              Write-Warning "No .debug_info section found in $firstLib. Check compiler flags in Makefile."
-            } else {
-              $debugSections | Select-Object -First 10
-              Write-Host "Success: AArch64 architecture and DWARF debug symbols verified!"
-            }
+            Write-Host "=== 2. Verifying DWARF Debug Sections ==="
+            & $readelf -S "$firstLib" | Select-String -Pattern "debug_info|debug_line" | Select-Object -First 10
           }
 
-      - name: Upload Build Artifacts (Libraries & Headers)
+      - name: Upload Build Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: physx-3.4-android-arm64-${{ github.event.inputs.build_config || 'checked' }}-symbols
           path: |
-            **/Bin/android*/
-            **/Lib/android*/
-            **/Include/
+            PhysX_3.4/Bin/android*/
+            PhysX_3.4/Lib/android*/
+            PhysX_3.4/Include/
+            PxShared/include/
